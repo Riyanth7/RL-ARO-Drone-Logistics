@@ -1,396 +1,305 @@
-
 import numpy as np
 from collections import deque
 
 
-class RLAROAgent:
-    """Reinforcement-learning agent for adaptive drone-logistics routing."""
+class MultiHeadAttention:
+    """Multi-head attention in pure NumPy."""
 
-    def __init__(
-        self,
-        num_nodes=10,
-        learning_rate=0.05,
-        gamma=0.95,
-        epsilon_start=1.0,
-        epsilon_end=0.05,
-        epsilon_decay=0.96,
-        seed=42,
-    ):
-        if num_nodes < 2:
-            raise ValueError("num_nodes must be at least 2.")
-        if not 0.0 < learning_rate <= 1.0:
-            raise ValueError("learning_rate must be in (0, 1].")
-        if not 0.0 <= gamma <= 1.0:
-            raise ValueError("gamma must be in [0, 1].")
-        if not 0.0 <= epsilon_end <= epsilon_start <= 1.0:
-            raise ValueError(
-                "Require 0 <= epsilon_end <= epsilon_start <= 1."
-            )
-        if not 0.0 < epsilon_decay <= 1.0:
-            raise ValueError("epsilon_decay must be in (0, 1].")
+    def __init__(self, d_model=16, num_heads=4, seed=42):
+        if d_model % num_heads != 0:
+            raise ValueError("d_model must be divisible by num_heads")
 
-        self.num_nodes = int(num_nodes)
-        self.lr = float(learning_rate)
-        self.gamma = float(gamma)
-        self.epsilon = float(epsilon_start)
-        self.epsilon_end = float(epsilon_end)
-        self.epsilon_decay = float(epsilon_decay)
+        if num_heads <= 0 or d_model <= 0 or d_model % num_heads != 0:
+            raise ValueError("d_model and num_heads must be positive, and d_model divisible by num_heads")
 
-        # A dedicated RNG avoids resetting NumPy's global random state.
-        self.rng = np.random.default_rng(seed)
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        rng = np.random.default_rng(seed)
 
-        # Q[current_node, action_node, congestion_tier]
-        self.q_table = np.zeros(
-            (self.num_nodes, self.num_nodes, 3),
-            dtype=np.float64,
-        )
+        self.W_Q = rng.normal(0, 0.1, (num_heads, d_model, self.d_k))
+        self.W_K = rng.normal(0, 0.1, (num_heads, d_model, self.d_k))
+        self.W_V = rng.normal(0, 0.1, (num_heads, d_model, self.d_k))
+        self.W_O = rng.normal(0, 0.1, (d_model, d_model))
 
-        # Two attention heads, each projecting 4-D state vectors.
-        self.num_heads = 2
-        self.d_k = 4
-
-        self.W_Q = [
-            self.rng.uniform(0.1, 0.5, (self.d_k, 4))
-            for _ in range(self.num_heads)
-        ]
-        self.W_K = [
-            self.rng.uniform(0.1, 0.5, (self.d_k, 4))
-            for _ in range(self.num_heads)
-        ]
-        self.W_V = [
-            self.rng.uniform(0.1, 0.5, (self.d_k, 4))
-            for _ in range(self.num_heads)
-        ]
-
-        # Bounded replay memory.
-        self.buffer_capacity = 5000
-        self.replay_buffer = deque(maxlen=self.buffer_capacity)
-
-    def _validate_node(self, node):
-        """Validate and normalize a node index."""
-        if not isinstance(node, (int, np.integer)):
-            raise TypeError("Node indices must be integers.")
-
-        node = int(node)
-
-        if not 0 <= node < self.num_nodes:
-            raise ValueError(
-                f"Node index {node} is outside "
-                f"the valid range [0, {self.num_nodes - 1}]."
-            )
-
-        return node
-
-    @staticmethod
-    def _validate_tier(tier):
-        """Validate a congestion tier in {0, 1, 2}."""
-        if not isinstance(tier, (int, np.integer)):
-            raise TypeError("Congestion tier must be an integer.")
-
-        tier = int(tier)
-
-        if tier not in (0, 1, 2):
-            raise ValueError("Congestion tier must be 0, 1, or 2.")
-
-        return tier
-
-    @staticmethod
-    def _state_vector(vector, name):
-        """Ensure a state vector has four finite numerical features."""
-        vector = np.asarray(vector, dtype=np.float64)
-
-        if vector.shape != (4,):
-            raise ValueError(
-                f"{name} must have shape (4,), got {vector.shape}."
-            )
-
-        if not np.all(np.isfinite(vector)):
-            raise ValueError(f"{name} contains non-finite values.")
-
-        return vector
-
-    def compute_attention_context(
-        self, local_state_vec, neighbor_state_vecs
-    ):
+    def forward(self, states):
         """
-        Compute two-head attention over the local node and its neighbors.
-
-        Returns:
-            0: low context magnitude
-            1: medium context magnitude
-            2: high context magnitude
+        states: (N, d_model)  – local state first, then neighbors
+        Returns context vector of shape (d_model,)
         """
-        local_state_vec = self._state_vector(
-            local_state_vec, "local_state_vec"
-        )
+        states = np.asarray(states, dtype=np.float64)
+        if states.ndim != 2 or states.shape[1] != self.d_model:
+            raise ValueError(f"states must have shape (N, {self.d_model})")
 
-        neighbors = [
-            self._state_vector(vec, "neighbor_state_vec")
-            for vec in neighbor_state_vecs
-        ]
-
-        all_states = [local_state_vec] + neighbors
         head_outputs = []
 
         for h in range(self.num_heads):
-            q_i = self.W_Q[h] @ local_state_vec
+            Q = states @ self.W_Q[h]          # (N, d_k)
+            K = states @ self.W_K[h]
+            V = states @ self.W_V[h]
 
-            keys = np.stack([
-                self.W_K[h] @ state for state in all_states
-            ])
-            values = np.stack([
-                self.W_V[h] @ state for state in all_states
-            ])
+            scores = (Q @ K.T) / np.sqrt(self.d_k)
+            scores -= np.max(scores, axis=-1, keepdims=True)  # numerical stability
 
-            # FIX: Convert the scores to a NumPy array before
-            # subtracting their maximum.
-            scores = (keys @ q_i) / np.sqrt(self.d_k)
-            scores = scores - np.max(scores)
+            weights = np.exp(scores)
+            weights /= np.sum(weights, axis=-1, keepdims=True) + 1e-8
 
-            exp_scores = np.exp(scores)
-            denominator = np.sum(exp_scores)
+            # Use the local agent's attended representation
+            head_out = weights[0] @ V
+            head_outputs.append(head_out)
 
-            if not np.isfinite(denominator) or denominator <= 0:
-                raise FloatingPointError(
-                    "Attention normalization failed."
-                )
+        concat = np.concatenate(head_outputs)          # (d_model,)
+        context = concat @ self.W_O
+        return context
 
-            attention_weights = exp_scores / denominator
-            head_output = np.sum(
-                attention_weights[:, None] * values,
-                axis=0,
-            )
 
-            head_outputs.append(head_output)
+class DQN:
+    """Deep Q-Network: input → 128 → 64 → 32 → output (full backprop)."""
 
-        concat_context = np.concatenate(head_outputs)
-        context_magnitude = float(np.mean(concat_context))
+    def __init__(self, input_dim, output_dim, seed=42):
+        rng = np.random.default_rng(seed)
 
-        if context_magnitude < 0.35:
-            return 0
-        elif context_magnitude < 0.70:
-            return 1
+        self.w1 = rng.normal(0, 0.1, (input_dim, 128))
+        self.b1 = np.zeros(128)
+        self.w2 = rng.normal(0, 0.1, (128, 64))
+        self.b2 = np.zeros(64)
+        self.w3 = rng.normal(0, 0.1, (64, 32))
+        self.b3 = np.zeros(32)
+        self.w4 = rng.normal(0, 0.1, (32, output_dim))
+        self.b4 = np.zeros(output_dim)
 
-        return 2
+    def forward(self, x):
+        """Forward pass that also returns intermediates for backprop."""
+        x = np.asarray(x, dtype=np.float64)
+
+        z1 = x @ self.w1 + self.b1
+        h1 = np.maximum(0, z1)              # ReLU
+
+        z2 = h1 @ self.w2 + self.b2
+        h2 = np.maximum(0, z2)
+
+        z3 = h2 @ self.w3 + self.b3
+        h3 = np.maximum(0, z3)
+
+        q = h3 @ self.w4 + self.b4
+        return q, (x, z1, h1, z2, h2, z3, h3)
+
+    def copy_weights_from(self, other):
+        for name in ("w1", "b1", "w2", "b2", "w3", "b3", "w4", "b4"):
+            setattr(self, name, getattr(other, name).copy())
+
+
+class RLAROAgent:
+    def __init__(
+        self,
+        num_nodes=10,
+        state_dim=16,
+        learning_rate=1e-3,
+        gamma=0.95,
+        epsilon_start=1.0,
+        epsilon_end=0.05,
+        epsilon_decay=0.995,
+        buffer_capacity=50000,
+        batch_size=64,
+        target_update_freq=500,
+        max_grad_norm=5.0,
+        seed=42,
+    ):
+        if num_nodes <= 0:
+            raise ValueError("num_nodes must be positive")
+        if state_dim <= 0 or state_dim % 4 != 0:
+            raise ValueError("state_dim must be positive and divisible by 4")
+        if batch_size <= 0 or buffer_capacity <= 0 or target_update_freq <= 0:
+            raise ValueError("batch_size, buffer_capacity, and target_update_freq must be positive")
+        if max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be positive")
+
+        self.num_nodes = num_nodes
+        self.state_dim = state_dim
+        self.lr = learning_rate
+        self.gamma = gamma
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.batch_size = batch_size
+        self.target_update_freq = target_update_freq
+        self.max_grad_norm = max_grad_norm
+        self.train_step = 0
+        self.rng = np.random.default_rng(seed)
+
+        self.attention = MultiHeadAttention(d_model=state_dim, num_heads=4, seed=seed)
+        self.q_network = DQN(input_dim=state_dim, output_dim=num_nodes, seed=seed)
+        self.target_network = DQN(input_dim=state_dim, output_dim=num_nodes, seed=seed + 1)
+        self.target_network.copy_weights_from(self.q_network)
+
+        self.replay_buffer = deque(maxlen=buffer_capacity)
+
+    def _build_state_vector(self, node_id, energy_norm, congestion, qos):
+        return np.array([
+            node_id / self.num_nodes,
+            energy_norm,
+            congestion,
+            qos
+        ], dtype=np.float64)
+
+    def encode_state(self, local_node, local_features, neighbor_list):
+        """
+        local_features: (energy_norm, congestion, qos)
+        neighbor_list: list of tuples (neighbor_node_id, energy_norm, congestion, qos)
+        """
+        if not 0 <= local_node < self.num_nodes:
+            raise ValueError("local_node is out of range")
+        if len(local_features) != 3:
+            raise ValueError("local_features must contain (energy_norm, congestion, qos)")
+
+        def pad(vec):
+            if len(vec) < self.state_dim:
+                return np.pad(vec, (0, self.state_dim - len(vec)))
+            return vec[:self.state_dim]
+
+        states = [pad(self._build_state_vector(local_node, *local_features))]
+
+        for neigh in neighbor_list:
+            # neigh = (node_id, energy, congestion, qos)
+            if len(neigh) != 4 or not 0 <= neigh[0] < self.num_nodes:
+                raise ValueError("each neighbor must be (valid_node_id, energy, congestion, qos)")
+            states.append(pad(self._build_state_vector(*neigh)))
+
+        return self.attention.forward(np.stack(states))
 
     def compute_reward(
         self,
         energy_saved_norm,
         energy_consumed_norm,
         data_loss_rate,
-        route_cost_dro,
-        qos_index,
-        auth_delay_ms,
+        route_cost_dro=0.0,
+        qos_index=0.9,
+        auth_delay_ms=20.0,
         alpha=0.55,
         beta=0.45,
     ):
-        """
-        Compute the RL-ARO reward using the supplied reward equation.
+        base = alpha * (energy_saved_norm - energy_consumed_norm) + beta * (1.0 - data_loss_rate)
+        efficiency = 0.30 * (1.0 - route_cost_dro) + 0.15 * qos_index
+        security_penalty = 0.04 * (auth_delay_ms / 50.0)
+        return float(base + efficiency - security_penalty)
 
-        Inputs must use consistent normalization and units.
-        """
-        values = np.asarray(
-            [
-                energy_saved_norm,
-                energy_consumed_norm,
-                data_loss_rate,
-                route_cost_dro,
-                qos_index,
-                auth_delay_ms,
-                alpha,
-                beta,
-            ],
-            dtype=np.float64,
-        )
-
-        if not np.all(np.isfinite(values)):
-            raise ValueError("Reward inputs must all be finite.")
-
-        if alpha < 0 or beta < 0:
-            raise ValueError("alpha and beta must be non-negative.")
-
-        base_reward = (
-            alpha * (energy_saved_norm - energy_consumed_norm)
-            + beta * (1.0 - data_loss_rate)
-        )
-
-        efficiency_bonus = (
-            0.35 * (1.0 - route_cost_dro)
-            + 0.20 * qos_index
-        )
-
-        security_penalty = 0.05 * (auth_delay_ms / 50.0)
-
-        return float(
-            base_reward + efficiency_bonus - security_penalty
-        )
-
-    def select_action(
-        self,
-        current_node,
-        valid_neighbors,
-        congestion_tier,
-        edge_heuristics=None,
-        training=True,
-    ):
-        """
-        Select a neighboring node using epsilon-greedy Q-learning
-        with optional heuristic guidance.
-        """
-        current_node = self._validate_node(current_node)
-        congestion_tier = self._validate_tier(congestion_tier)
-
-        if not isinstance(training, (bool, np.bool_)):
-            raise TypeError("training must be a boolean.")
-
-        neighbors = list(dict.fromkeys(
-            self._validate_node(n) for n in valid_neighbors
-        ))
-
-        if not neighbors:
-            return current_node
-
-        if current_node in neighbors:
-            raise ValueError(
-                "A node cannot be its own valid neighbor."
-            )
+    def select_action(self, state_vec, valid_neighbors, training=True):
+        valid_neighbors = list(valid_neighbors)
+        if not valid_neighbors:
+            raise ValueError("valid_neighbors cannot be empty")
+        if any(not isinstance(n, (int, np.integer)) or not 0 <= n < self.num_nodes
+               for n in valid_neighbors):
+            raise ValueError("valid_neighbors contains an invalid action index")
 
         if training and self.rng.random() < self.epsilon:
-            return int(self.rng.choice(neighbors))
+            return int(self.rng.choice(valid_neighbors))
 
-        best_node = neighbors[0]
-        best_value = -np.inf
+        q_values = self.q_network.forward(state_vec)[0]
+        best_idx = int(np.argmax(q_values[valid_neighbors]))
+        return int(valid_neighbors[best_idx])
 
-        for neighbor in neighbors:
-            q_value = self.q_table[
-                current_node, neighbor, congestion_tier
-            ]
+    def store_transition(self, state, action, reward, next_state, done):
+        if not isinstance(action, (int, np.integer)) or not 0 <= action < self.num_nodes:
+            raise ValueError("action must be an integer in [0, num_nodes)")
+        state = np.asarray(state, dtype=np.float64)
+        next_state = np.asarray(next_state, dtype=np.float64)
+        if state.shape != (self.state_dim,) or next_state.shape != (self.state_dim,):
+            raise ValueError(f"state and next_state must have shape ({self.state_dim},)")
 
-            heuristic_bonus = 0.0
+        self.replay_buffer.append((
+            np.asarray(state, dtype=np.float64).copy(),
+            int(action),
+            float(reward),
+            np.asarray(next_state, dtype=np.float64).copy(),
+            bool(done)
+        ))
 
-            if (
-                edge_heuristics is not None
-                and neighbor in edge_heuristics
-            ):
-                heuristic_bonus = float(edge_heuristics[neighbor])
+    def _clip_grads(self, grads):
+        """Simple gradient clipping."""
+        total_norm = np.sqrt(sum(np.sum(g**2) for g in grads))
+        if total_norm > self.max_grad_norm:
+            scale = self.max_grad_norm / (total_norm + 1e-8)
+            return [g * scale for g in grads]
+        return grads
 
-                if not np.isfinite(heuristic_bonus):
-                    raise ValueError(
-                        "Edge heuristic values must be finite."
-                    )
-
-            total_value = q_value + heuristic_bonus
-
-            if total_value > best_value:
-                best_value = total_value
-                best_node = neighbor
-
-        return int(best_node)
-
-    def store_transition(
-        self,
-        state_tuple,
-        action,
-        reward,
-        next_state_tuple,
-        done,
-    ):
-        """Store one transition in the bounded replay buffer."""
-        if len(state_tuple) != 2 or len(next_state_tuple) != 2:
-            raise ValueError(
-                "State tuples must be (node, congestion_tier)."
-            )
-
-        current_node = self._validate_node(state_tuple[0])
-        current_tier = self._validate_tier(state_tuple[1])
-        action = self._validate_node(action)
-
-        next_node = self._validate_node(next_state_tuple[0])
-        next_tier = self._validate_tier(next_state_tuple[1])
-
-        reward = float(reward)
-
-        if not np.isfinite(reward):
-            raise ValueError("Reward must be finite.")
-
-        if not isinstance(done, (bool, np.bool_)):
-            raise TypeError("done must be a boolean.")
-
-        self.replay_buffer.append(
-            (
-                (current_node, current_tier),
-                action,
-                reward,
-                (next_node, next_tier),
-                bool(done),
-            )
-        )
-
-    def update_policy(self, batch_size=32):
-        """
-        Update Q-values using sampled one-step TD targets.
-
-        Returns:
-            Mean absolute TD error, or 0.0 if no transitions exist.
-        """
-        if not isinstance(batch_size, (int, np.integer)):
-            raise TypeError("batch_size must be an integer.")
-
-        if batch_size < 1:
-            raise ValueError("batch_size must be at least 1.")
-
-        buffer_size = len(self.replay_buffer)
-
-        if buffer_size == 0:
+    def update_policy(self):
+        if len(self.replay_buffer) < self.batch_size:
             return 0.0
 
-        sample_size = min(buffer_size, int(batch_size))
+        indices = self.rng.choice(len(self.replay_buffer), size=self.batch_size, replace=False)
+        batch = [self.replay_buffer[int(i)] for i in indices]
 
-        indices = self.rng.choice(
-            buffer_size,
-            size=sample_size,
-            replace=False,
-        )
+        states      = np.stack([b[0] for b in batch])
+        actions     = np.array([b[1] for b in batch])
+        rewards     = np.array([b[2] for b in batch])
+        next_states = np.stack([b[3] for b in batch])
+        dones       = np.array([b[4] for b in batch])
 
-        td_losses = []
+        # Target values
+        next_q = np.stack([self.target_network.forward(s)[0] for s in next_states])
+        targets = rewards + self.gamma * (~dones) * np.max(next_q, axis=1)
 
-        for idx in indices:
-            (
-                (curr_node, curr_tier),
-                action,
-                reward,
-                (next_node, next_tier),
-                done,
-            ) = self.replay_buffer[int(idx)]
+        total_loss = 0.0
 
-            current_q = self.q_table[
-                curr_node, action, curr_tier
-            ]
+        # Accumulate gradients
+        gw1 = np.zeros_like(self.q_network.w1)
+        gb1 = np.zeros_like(self.q_network.b1)
+        gw2 = np.zeros_like(self.q_network.w2)
+        gb2 = np.zeros_like(self.q_network.b2)
+        gw3 = np.zeros_like(self.q_network.w3)
+        gb3 = np.zeros_like(self.q_network.b3)
+        gw4 = np.zeros_like(self.q_network.w4)
+        gb4 = np.zeros_like(self.q_network.b4)
 
-            if done:
-                target_q = reward
-            else:
-                target_q = (
-                    reward
-                    + self.gamma
-                    * np.max(
-                        self.q_table[next_node, :, next_tier]
-                    )
-                )
+        for i in range(self.batch_size):
+            q_values, (x, z1, h1, z2, h2, z3, h3) = self.q_network.forward(states[i])
 
-            td_error = target_q - current_q
+            # Error only on the taken action
+            error = q_values[actions[i]] - targets[i]
+            total_loss += error ** 2
 
-            self.q_table[
-                curr_node, action, curr_tier
-            ] += self.lr * td_error
+            # Output gradient
+            dq = np.zeros_like(q_values)
+            dq[actions[i]] = 2.0 * error / self.batch_size
 
-            td_losses.append(abs(td_error))
+            # Layer 4
+            gw4 += np.outer(h3, dq)
+            gb4 += dq
+            dh3 = dq @ self.q_network.w4.T
+            dh3 *= (z3 > 0)               # ReLU backward
 
-        return float(np.mean(td_losses))
+            # Layer 3
+            gw3 += np.outer(h2, dh3)
+            gb3 += dh3
+            dh2 = dh3 @ self.q_network.w3.T
+            dh2 *= (z2 > 0)
+
+            # Layer 2
+            gw2 += np.outer(h1, dh2)
+            gb2 += dh2
+            dh1 = dh2 @ self.q_network.w2.T
+            dh1 *= (z1 > 0)
+
+            # Layer 1
+            gw1 += np.outer(x, dh1)
+            gb1 += dh1
+
+        # Clip and apply gradients
+        grads = self._clip_grads([gw1, gb1, gw2, gb2, gw3, gb3, gw4, gb4])
+        self.q_network.w1 -= self.lr * grads[0]
+        self.q_network.b1 -= self.lr * grads[1]
+        self.q_network.w2 -= self.lr * grads[2]
+        self.q_network.b2 -= self.lr * grads[3]
+        self.q_network.w3 -= self.lr * grads[4]
+        self.q_network.b3 -= self.lr * grads[5]
+        self.q_network.w4 -= self.lr * grads[6]
+        self.q_network.b4 -= self.lr * grads[7]
+
+        self.train_step += 1
+        if self.train_step % self.target_update_freq == 0:
+            self.target_network.copy_weights_from(self.q_network)
+
+        return float(total_loss / self.batch_size)
 
     def decay_exploration(self):
-        """Reduce epsilon after each training episode."""
-        self.epsilon = max(
-            self.epsilon_end,
-            self.epsilon * self.epsilon_decay,
-        )
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
