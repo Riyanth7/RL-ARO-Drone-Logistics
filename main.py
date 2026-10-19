@@ -1,443 +1,199 @@
-
 import numpy as np
+
 from agent import RLAROAgent
-from network import IoTNetworkSimulator
 from environment import DroneLogisticsEnvironment
+from network import IoTNetworkSimulator
 from evaluator import RLAROEvaluator
 
 
-def execute_route_mission(
-    env, net_sim, path, is_rl_aro=True, perturbation=0.0
-):
-    """Executes a complete drone delivery mission across a node path."""
+def set_environment_congestion(env, perturbation):
+    """Reset every link from its base congestion using one common offset."""
+    for u, v in env.graph.edges():
+        edge = env.graph[u][v]
+        edge["congestion"] = float(np.clip(
+            edge["base_congestion"] + perturbation, 0.05, 0.95
+        ))
+    env.update_edge_costs()
+
+
+def _local_features(env, node):
+    """Build the agent's (energy_norm, congestion, qos) local feature tuple."""
+    neighbors = env.get_neighbors_info(node)
+    if not neighbors:
+        return (0.0, 0.0, 1.0)
+    return tuple(float(np.mean([row[i] for row in neighbors])) for i in (1, 2, 3))
+
+
+def execute_route(env, net_sim, path, fleet_size=12):
+    """Execute a node path and return route-level metrics expected by evaluator."""
+    if not isinstance(path, (list, tuple)) or len(path) < 2:
+        raise ValueError("path must contain at least a source and destination")
+    if fleet_size <= 0:
+        raise ValueError("fleet_size must be positive")
+
     total_time_min = 0.0
     total_energy_wh = 0.0
-    total_energy_saved = 0.0
+    route_success_probability = 1.0
+    total_network_latency_ms = 0.0
 
-    pdr_list = []
-    latency_list = []
-    throughput_list = []
-    dro_list = []
-    qos_list = []
-    auth_list = []
-
-    for i in range(len(path) - 1):
-        u, v = path[i], path[i + 1]
-
-        # Ensure the selected hop is a valid graph edge.
+    for u, v in zip(path, path[1:]):
         if not env.graph.has_edge(u, v):
-            sub_path = env.get_dijkstra_route(u, v)
-            for j in range(len(sub_path) - 1):
-                a, b = sub_path[j], sub_path[j + 1]
+            raise ValueError(f"Route contains non-edge hop ({u}, {v})")
 
-                phys = env.evaluate_hop_physics(
-                    a, b, dynamic_perturbation=perturbation
-                )
-                net = net_sim.simulate_wireless_link(
-                    distance_m=phys["distance_m"],
-                    congestion_level=phys["congestion"],
-                    num_drones=20,
-                    is_rl_aro=is_rl_aro,
-                )
-
-                total_time_min += phys["flight_time_min"]
-                total_energy_wh += phys["energy_wh"]
-                total_energy_saved += phys["energy_saved_wh"]
-                pdr_list.append(net["pdr_percent"])
-                latency_list.append(net["latency_ms"])
-                throughput_list.append(net["throughput_mbps"])
-                dro_list.append(phys["d_ro"])
-                qos_list.append(net["q_svc"])
-                auth_list.append(net["b_auth_ms"])
-
-            continue
-
-        phys = env.evaluate_hop_physics(
-            u, v, dynamic_perturbation=perturbation
-        )
-        net = net_sim.simulate_wireless_link(
+        phys = env.evaluate_hop_physics(u, v)
+        link = net_sim.simulate_wireless_link(
             distance_m=phys["distance_m"],
             congestion_level=phys["congestion"],
-            num_drones=20,
-            is_rl_aro=is_rl_aro,
+            num_drones=fleet_size,
+            payload_mb=60.0,
         )
-
         total_time_min += phys["flight_time_min"]
         total_energy_wh += phys["energy_wh"]
-        total_energy_saved += phys["energy_saved_wh"]
-
-        pdr_list.append(net["pdr_percent"])
-        latency_list.append(net["latency_ms"])
-        throughput_list.append(net["throughput_mbps"])
-        dro_list.append(phys["d_ro"])
-        qos_list.append(net["q_svc"])
-        auth_list.append(net["b_auth_ms"])
-
-    if not pdr_list:
-        raise ValueError("Cannot evaluate an empty route.")
-
-    scale_factor = 20.0
-    fleet_energy_wh = total_energy_wh * scale_factor * (
-        0.72 if is_rl_aro else 0.95
-    )
-    adj_time_min = total_time_min * (
-        0.76 if is_rl_aro else 1.08
-    )
+        route_success_probability *= link["pdr_percent"] / 100.0
+        total_network_latency_ms += link["latency_ms"]
 
     return {
-        "delivery_time_min": float(adj_time_min),
-        "fleet_energy_wh": float(fleet_energy_wh),
-        "energy_saved_wh": float(total_energy_saved),
-        "pdr_percent": float(np.mean(pdr_list)),
-        "latency_ms": float(np.mean(latency_list)),
-        "throughput_mbps": float(np.mean(throughput_list)),
-        "mean_dro": float(np.mean(dro_list)),
-        "mean_qos": float(np.mean(qos_list)),
-        "mean_auth_ms": float(np.mean(auth_list)),
+        "delivery_time_min": float(total_time_min),
+        # Explicit model assumption: fleet_size identical drones execute this route.
+        "fleet_energy_wh": float(total_energy_wh * fleet_size),
+        # End-to-end delivery success for a packet traversing every hop.
+        "pdr_percent": float(100.0 * route_success_probability),
+        # Sequential hop communication latencies are additive.
+        "latency_ms": float(total_network_latency_ms),
     }
 
 
-def train_and_evaluate_single_seed(seed, num_episodes=180):
-    """Trains and evaluates the routing agent for one random seed."""
-    env = DroneLogisticsEnvironment(num_nodes=10, seed=seed)
-    net_sim = IoTNetworkSimulator(seed=seed)
-    agent = RLAROAgent(num_nodes=10, seed=seed)
+def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
+                evaluation_perturbation=0.06):
+    """Train the shared policy and return its greedy source-to-destination path."""
+    if num_episodes <= 0 or max_steps <= 0:
+        raise ValueError("num_episodes and max_steps must be positive")
 
-    rl_episode_rewards = []
-
-    for ep in range(num_episodes):
-        current = 0
-        target = 9
+    source, target = 0, 9
+    for _ in range(num_episodes):
+        episode_perturbation = float(env.rng.uniform(-0.06, 0.10))
+        set_environment_congestion(env, episode_perturbation)
+        current = source
         visited = {current}
-        ep_reward = 0.0
 
-        perturbation = np.random.uniform(-0.05, 0.10)
-        env.update_edge_costs(dynamic_perturbation=perturbation)
-
-        for _ in range(12):
+        for _step in range(max_steps):
             if current == target:
                 break
 
-            neighbors = [
-                n for n in env.graph.neighbors(current)
-                if n not in visited
-            ]
-
-            if not neighbors:
-                neighbors = list(env.graph.neighbors(current))
-
-            local_vec = np.array([
-                current / 10.0, 0.8, 0.2, 0.9
-            ])
-
-            neighbor_vecs = [
-                np.array([
-                    n / 10.0,
-                    0.7,
-                    env.graph[current][n]["congestion"],
-                    0.85,
-                ])
-                for n in neighbors
-            ]
-
-            c_tier = agent.compute_attention_context(
-                local_vec, neighbor_vecs
+            neighbor_info = env.get_neighbors_info(current)
+            if not neighbor_info:
+                break
+            valid_actions = [int(item[0]) for item in neighbor_info]
+            state = agent.encode_state(
+                current, _local_features(env, current), neighbor_info
             )
+            action = agent.select_action(state, valid_actions, training=True)
 
-            heuristics = {}
-
-            for n in neighbors:
-                # FIX: Use env, not self.
-                dist_to_goal = np.linalg.norm(
-                    env.node_positions[n]
-                    - env.node_positions[target]
-                )
-
-                heuristics[n] = (
-                    1.0 - env.graph[current][n]["cost"]
-                ) + (1.0 - dist_to_goal / 1400.0)
-
-            next_node = agent.select_action(
-                current,
-                neighbors,
-                c_tier,
-                edge_heuristics=heuristics,
-                training=True,
+            phys = env.evaluate_hop_physics(current, action)
+            link = net_sim.simulate_wireless_link(
+                distance_m=phys["distance_m"],
+                congestion_level=phys["congestion"],
+                num_drones=12,
             )
-
-            phys = env.evaluate_hop_physics(
-                current,
-                next_node,
-                dynamic_perturbation=perturbation,
-            )
-
-            net = net_sim.simulate_wireless_link(
-                phys["distance_m"],
-                phys["congestion"],
-                is_rl_aro=True,
-            )
-
             reward = agent.compute_reward(
-                energy_saved_norm=np.clip(
-                    phys["energy_saved_wh"] / 20.0, 0.0, 1.0
-                ),
-                energy_consumed_norm=np.clip(
-                    phys["energy_wh"] / 30.0, 0.0, 1.0
-                ),
-                data_loss_rate=net["packet_loss"],
+                energy_saved_norm=np.clip(phys["energy_saved_wh"] / 25.0, 0.0, 1.0),
+                energy_consumed_norm=np.clip(phys["energy_wh"] / 30.0, 0.0, 1.0),
+                data_loss_rate=link["packet_loss"],
                 route_cost_dro=phys["d_ro"],
-                qos_index=net["q_svc"],
-                auth_delay_ms=net["b_auth_ms"],
+                qos_index=link["q_svc"],
+                auth_delay_ms=link["b_auth_ms"],
             )
-
-            done = next_node == target
-
+            revisited = action in visited
+            done = action == target
             if done:
-                reward += 2.5
+                reward += 3.0
+            elif revisited:
+                reward -= 0.25
 
-            agent.store_transition(
-                (current, c_tier),
-                next_node,
-                reward,
-                (next_node, c_tier),
-                done,
+            next_neighbors = env.get_neighbors_info(action)
+            next_state = agent.encode_state(
+                action, _local_features(env, action), next_neighbors
             )
+            agent.store_transition(state, action, reward, next_state, done)
+            agent.update_policy()
 
-            agent.update_policy(batch_size=16)
-
-            ep_reward += reward
-            visited.add(next_node)
-            current = next_node
+            current = action
+            visited.add(action)
 
         agent.decay_exploration()
-        rl_episode_rewards.append(ep_reward)
 
-    # Extract the learned RL-ARO route.
-    current = 0
-    target = 9
-    rl_path = [current]
-    visited = {current}
-
-    while current != target and len(rl_path) < 12:
-        neighbors = [
-            n for n in env.graph.neighbors(current)
-            if n not in visited
+    # Evaluate the learned policy under the same fixed condition used by baselines.
+    set_environment_congestion(env, evaluation_perturbation)
+    path = [source]
+    current = source
+    visited = {source}
+    while current != target and len(path) < env.num_nodes + 1:
+        neighbor_info = [
+            item for item in env.get_neighbors_info(current)
+            if item[0] not in visited
         ]
-
-        if not neighbors:
-            fallback = env.get_dijkstra_route(current, target)
-            rl_path.extend(fallback[1:])
+        if not neighbor_info:
+            path.extend(env.get_dijkstra_route(current, target)[1:])
             break
-
-        heuristics = {
-            n: (
-                1.0 - env.graph[current][n]["cost"]
-            ) + (
-                1.0
-                - np.linalg.norm(
-                    env.node_positions[n]
-                    - env.node_positions[target]
-                ) / 1400.0
-            )
-            for n in neighbors
-        }
-
+        state = agent.encode_state(current, _local_features(env, current), neighbor_info)
         next_node = agent.select_action(
-            current,
-            neighbors,
-            1,
-            edge_heuristics=heuristics,
-            training=False,
+            state, [int(item[0]) for item in neighbor_info], training=False
         )
-
-        rl_path.append(next_node)
+        path.append(next_node)
         visited.add(next_node)
         current = next_node
 
-    # Baseline routes.
-    aco_path = env.get_aco_route(0, 9)
-    tspd_path = env.get_tspd_route(0, 9)
-    dbscan_path = env.get_dbscan_route(0, 9)
+    if path[-1] != target:
+        path.extend(env.get_dijkstra_route(path[-1], target)[1:])
+    return path
 
-    return {
-        "ACO": execute_route_mission(
-            env, net_sim, aco_path,
-            is_rl_aro=False, perturbation=0.12
-        ),
-        "TSP-D": execute_route_mission(
-            env, net_sim, tspd_path,
-            is_rl_aro=False, perturbation=0.08
-        ),
-        "DBSCAN": execute_route_mission(
-            env, net_sim, dbscan_path,
-            is_rl_aro=False, perturbation=0.04
-        ),
-        "RL-ARO": execute_route_mission(
-            env, net_sim, rl_path,
-            is_rl_aro=True, perturbation=0.0
-        ),
-        "rl_path": rl_path,
-        "episode_rewards": rl_episode_rewards,
+
+def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
+    """Train and evaluate methods for one reproducible seed."""
+    env = DroneLogisticsEnvironment(num_nodes=10, seed=seed)
+    training_network = IoTNetworkSimulator(seed=seed)
+    agent = RLAROAgent(num_nodes=env.num_nodes, seed=seed)
+
+    rl_path = train_agent(
+        env, training_network, agent,
+        num_episodes=num_episodes,
+        evaluation_perturbation=evaluation_perturbation,
+    )
+
+    # All methods are routed/evaluated on the same graph condition.
+    set_environment_congestion(env, evaluation_perturbation)
+    routes = {
+        "ACO": env.get_aco_route(0, 9),
+        "TSP-D": env.get_tspd_route(0, 9),
+        "DBSCAN": env.get_dbscan_route(0, 9),
+        "RL-ARO": rl_path,
     }
 
+    results = {}
+    for index, method in enumerate(("ACO", "TSP-D", "DBSCAN", "RL-ARO")):
+        # Identical RNG initialization gives the methods common link-noise draws.
+        eval_network = IoTNetworkSimulator(seed=seed + 10000)
+        results[method] = execute_route(env, eval_network, routes[method])
+    results["rl_path"] = rl_path
+    return results
 
-def run_full_framework():
+
+def main():
     seeds = [42, 123, 256, 512, 1024]
+    print(f"Running simulation for {len(seeds)} seeds...")
+
+    seed_outputs = []
+    for index, seed in enumerate(seeds, start=1):
+        result = run_single_seed(seed, num_episodes=100)
+        seed_outputs.append(result)
+        print(f"Seed {index}/{len(seeds)}: learned path {result['rl_path']}")
+
     evaluator = RLAROEvaluator(seeds=seeds)
-
-    seed_outputs = [
-        train_and_evaluate_single_seed(seed)
-        for seed in seeds
-    ]
-
-    # NOTE: These curve values are illustrative formulas,
-    # not results directly calculated from the training runs.
-    missions_x = np.linspace(100, 200, 21)
-    drones_x = np.linspace(600, 1400, 21)
-    episodes_x = np.linspace(100, 500, 21)
-    events_x = np.linspace(1, 20, 20)
-    comm_x = np.linspace(100, 500, 21)
-
-    results_dict = {
-        "missions_x": missions_x,
-        "drones_x": drones_x,
-        "episodes_x": episodes_x,
-        "events_x": events_x,
-        "comm_x": comm_x,
-
-        "fig4_delivery_time": {
-            "ACO": 54.0 + 3.5 * np.sin(
-                (missions_x - 120) / 18.0
-            ),
-            "TSP-D": 51.0 + 4.2 * np.cos(
-                (missions_x - 100) / 22.0
-            ),
-            "DBSCAN": 47.5 - 4.5 * np.sin(
-                (missions_x - 100) / 30.0
-            ),
-            "Proposed RL-ARO": 53.0 - 15.5 * (
-                1.0 / (
-                    1.0 + np.exp(-(missions_x - 142) / 10.0)
-                )
-            ),
-        },
-
-        "fig5_energy": {
-            "ACO": 1140 + 0.08 * (drones_x - 600),
-            "TSP-D": 1060 + 0.06 * (drones_x - 600),
-            "DBSCAN": 965 + 0.05 * (drones_x - 600),
-            "Proposed RL-ARO": 845 + 0.02 * (drones_x - 600),
-        },
-
-        "fig6_optimality": {
-            "ACO": 74.5 + 1.8 * np.cos(episodes_x / 45.0),
-            "TSP-D": 76.5 + 3.2 * np.cos(episodes_x / 55.0),
-            "DBSCAN": 78.5 + 2.8 * np.cos(episodes_x / 60.0),
-            "Proposed RL-ARO": 90.5 + 1.8 * np.cos(
-                episodes_x / 70.0
-            ),
-        },
-
-        "fig7_adaptation": {
-            "ACO": 9.1 + 0.6 * np.sin(events_x / 2.5),
-            "TSP-D": 8.5 + 0.7 * np.cos(events_x / 3.0),
-            "DBSCAN": 7.9 + 0.6 * np.cos(events_x / 2.8),
-            "Proposed RL-ARO": 5.5 + 0.35 * np.cos(
-                events_x / 2.5
-            ),
-        },
-
-        "fig8_pdr": {
-            "ACO": 88.5 + 2.5 * np.cos(comm_x / 55.0),
-            "TSP-D": 90.2 + 2.2 * np.cos(comm_x / 60.0),
-            "DBSCAN": 92.0 + 1.6 * np.cos(comm_x / 65.0),
-            "Proposed RL-ARO": 97.2 + 1.1 * np.cos(
-                comm_x / 75.0
-            ),
-        },
-
-        "table3": {
-            "ACO": {
-                "throughput": 42.5, "latency": 95.0,
-                "energy": 1120.0
-            },
-            "TSP-D": {
-                "throughput": 46.8, "latency": 89.0,
-                "energy": 1040.0
-            },
-            "DBSCAN": {
-                "throughput": 51.3, "latency": 84.0,
-                "energy": 960.0
-            },
-            "RL-ARO": {
-                "throughput": 64.5, "latency": 63.0,
-                "energy": 850.0
-            },
-        },
-
-        "table4": {
-            "ACO": {
-                "recovery": 72.3, "resilience": 68.5,
-                "loss": 11.8, "downtime": 14.2
-            },
-            "TSP-D": {
-                "recovery": 78.9, "resilience": 73.4,
-                "loss": 9.6, "downtime": 12.7
-            },
-            "DBSCAN": {
-                "recovery": 83.1, "resilience": 77.8,
-                "loss": 7.9, "downtime": 10.4
-            },
-            "RL-ARO": {
-                "recovery": 94.6, "resilience": 91.7,
-                "loss": 3.4, "downtime": 5.6
-            },
-        },
-    }
-
-    chart_file = evaluator.generate_all_plots(results_dict)
-
-    aco_times = [
-        out["ACO"]["delivery_time_min"]
-        for out in seed_outputs
-    ]
-    rl_times = [
-        out["RL-ARO"]["delivery_time_min"]
-        for out in seed_outputs
-    ]
-
-    t_stat, p_val = evaluator.run_paired_ttest(
-        aco_times, rl_times
-    )
-
-    tog_gain = evaluator.compute_time_optimization_gain(
-        np.mean(aco_times), np.mean(rl_times)
-    )
-
-    print("=" * 66)
-    print(" RL-ARO DRONE LOGISTICS SIMULATION")
-    print("=" * 66)
-    print(f"Learned RL-ARO Route: {seed_outputs[0]['rl_path']}")
-    print(f"Mean ACO Delivery Time: {np.mean(aco_times):.2f} min")
-    print(f"Mean RL-ARO Delivery Time: {np.mean(rl_times):.2f} min")
-    print(f"Delivery Time Reduction: {tog_gain:.2f}%")
-    print(f"Paired t-test statistic: {t_stat:.4f}")
-    print(f"Paired t-test p-value: {p_val:.5f}")
-    print(
-        "Mean RL-ARO Fleet Energy: "
-        f"{np.mean([o['RL-ARO']['fleet_energy_wh'] for o in seed_outputs]):.2f} Wh"
-    )
-    print(
-        "Mean RL-ARO Latency: "
-        f"{np.mean([o['RL-ARO']['latency_ms'] for o in seed_outputs]):.2f} ms"
-    )
-    print(
-        "Mean RL-ARO PDR: "
-        f"{np.mean([o['RL-ARO']['pdr_percent'] for o in seed_outputs]):.2f}%"
-    )
-    print(f"Dashboard saved to: {chart_file}")
-    print("=" * 66)
+    evaluation = evaluator.evaluate(seed_outputs)
+    evaluator.print_report(evaluation, rl_path=seed_outputs[0]["rl_path"])
+    dashboard_path = evaluator.generate_dashboard(evaluation, seed_outputs)
+    print(f"Dashboard saved to: {dashboard_path}")
 
 
 if __name__ == "__main__":
-    run_full_framework()
+    main()
