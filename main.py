@@ -135,6 +135,16 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
                 qos_index=link["q_svc"],
                 auth_delay_ms=link["b_auth_ms"],
             )
+            # Mild shaping: favor progress and charge a small cost per hop.
+            current_distance = np.linalg.norm(
+                env.node_positions[current] - env.node_positions[target]
+            )
+            next_distance = np.linalg.norm(
+                env.node_positions[action] - env.node_positions[target]
+            )
+            reward += 0.10 * (current_distance - next_distance) / 1000.0
+            reward -= 0.01
+
             revisited = action in visited
             done = action == target
             if done:
@@ -194,15 +204,16 @@ def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
 
     # All methods are routed/evaluated on the same graph condition.
     set_environment_congestion(env, evaluation_perturbation)
+    raw_rl_path = list(rl_path)
     aco_path = env.get_aco_route(0, 9)
-    rl_path, used_aco_fallback = _apply_aco_nonregression_guard(
-        env, rl_path, aco_path
+    evaluated_rl_path, used_aco_fallback = _apply_aco_nonregression_guard(
+        env, raw_rl_path, aco_path
     )
     routes = {
         "ACO": aco_path,
         "TSP-D": env.get_tspd_route(0, 9),
         "DBSCAN": env.get_dbscan_route(0, 9),
-        "RL-ARO": rl_path,
+        "RL-ARO": evaluated_rl_path,
     }
 
     results = {}
@@ -210,21 +221,28 @@ def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
         # Identical RNG initialization gives the methods common link-noise draws.
         eval_network = IoTNetworkSimulator(seed=seed + 10000)
         results[method] = execute_route(env, eval_network, routes[method])
-    results["rl_path"] = rl_path
+    # Keep rl_path as the evaluated route for compatibility with existing reports.
+    results["raw_rl_path"] = raw_rl_path
+    results["evaluated_rl_path"] = evaluated_rl_path
+    results["rl_path"] = evaluated_rl_path
     results["used_aco_fallback"] = used_aco_fallback
     return results
 
 
-def main():
+def main(num_episodes=150):
+    """Run one episode-count experiment; rerun with 250 or 400 separately."""
+    if num_episodes <= 0:
+        raise ValueError("num_episodes must be positive")
     seeds = [42, 123, 256, 512, 1024]
-    print(f"Running simulation for {len(seeds)} seeds...")
+    print(f"Running simulation for {len(seeds)} seeds, {num_episodes} episodes each...")
 
     seed_outputs = []
     for index, seed in enumerate(seeds, start=1):
-        result = run_single_seed(seed, num_episodes=100)
+        result = run_single_seed(seed, num_episodes=num_episodes)
         seed_outputs.append(result)
         fallback_note = " (ACO safety fallback used)" if result["used_aco_fallback"] else ""
-        print(f"Seed {index}/{len(seeds)}: evaluated RL-ARO path {result['rl_path']}{fallback_note}")
+        print(f"Seed {index}/{len(seeds)}: raw RL path {result['raw_rl_path']}")
+        print(f"  Evaluated hybrid path {result['evaluated_rl_path']}{fallback_note}")
 
     evaluator = RLAROEvaluator(seeds=seeds)
     evaluation = evaluator.evaluate(seed_outputs)
