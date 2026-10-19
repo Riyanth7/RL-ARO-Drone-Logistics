@@ -6,9 +6,6 @@ class MultiHeadAttention:
     """Multi-head attention in pure NumPy."""
 
     def __init__(self, d_model=16, num_heads=4, seed=42):
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-
         if num_heads <= 0 or d_model <= 0 or d_model % num_heads != 0:
             raise ValueError("d_model and num_heads must be positive, and d_model divisible by num_heads")
 
@@ -198,20 +195,30 @@ class RLAROAgent:
         best_idx = int(np.argmax(q_values[valid_neighbors]))
         return int(valid_neighbors[best_idx])
 
-    def store_transition(self, state, action, reward, next_state, done):
+    def store_transition(self, state, action, reward, next_state, done, next_valid_actions=None):
         if not isinstance(action, (int, np.integer)) or not 0 <= action < self.num_nodes:
             raise ValueError("action must be an integer in [0, num_nodes)")
         state = np.asarray(state, dtype=np.float64)
         next_state = np.asarray(next_state, dtype=np.float64)
         if state.shape != (self.state_dim,) or next_state.shape != (self.state_dim,):
             raise ValueError(f"state and next_state must have shape ({self.state_dim},)")
+        if next_valid_actions is None:
+            next_valid_actions = list(range(self.num_nodes))
+        else:
+            next_valid_actions = list(next_valid_actions)
+        if any(not isinstance(a, (int, np.integer)) or not 0 <= a < self.num_nodes
+               for a in next_valid_actions):
+            raise ValueError("next_valid_actions contains an invalid action index")
+        if not done and not next_valid_actions:
+            raise ValueError("nonterminal transitions must have at least one valid next action")
 
         self.replay_buffer.append((
             np.asarray(state, dtype=np.float64).copy(),
             int(action),
             float(reward),
             np.asarray(next_state, dtype=np.float64).copy(),
-            bool(done)
+            bool(done),
+            tuple(int(a) for a in next_valid_actions),
         ))
 
     def _clip_grads(self, grads):
@@ -233,11 +240,16 @@ class RLAROAgent:
         actions     = np.array([b[1] for b in batch])
         rewards     = np.array([b[2] for b in batch])
         next_states = np.stack([b[3] for b in batch])
-        dones       = np.array([b[4] for b in batch])
+        dones       = np.array([b[4] for b in batch], dtype=bool)
+        next_valid_actions = [b[5] for b in batch]
 
-        # Target values
+        # Double-check target bootstrapping only considers legal next-hop actions.
         next_q = np.stack([self.target_network.forward(s)[0] for s in next_states])
-        targets = rewards + self.gamma * (~dones) * np.max(next_q, axis=1)
+        targets = rewards.copy()
+        for i in range(self.batch_size):
+            if not dones[i] and next_valid_actions[i]:
+                legal_q = next_q[i, list(next_valid_actions[i])]
+                targets[i] += self.gamma * np.max(legal_q)
 
         total_loss = 0.0
 
