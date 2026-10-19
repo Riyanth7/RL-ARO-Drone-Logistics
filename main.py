@@ -96,8 +96,12 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
                 num_drones=12,
             )
             reward = agent.compute_reward(
-                energy_saved_norm=np.clip(phys["energy_saved_wh"] / 25.0, 0.0, 1.0),
-                energy_consumed_norm=np.clip(phys["energy_wh"] / 30.0, 0.0, 1.0),
+                energy_saved_norm=np.clip(
+                    phys["energy_saved_wh"] / env.e_max_wh, 0.0, 1.0
+                ),
+                energy_consumed_norm=np.clip(
+                    phys["energy_wh"] / env.e_max_wh, 0.0, 1.0
+                ),
                 data_loss_rate=link["packet_loss"],
                 route_cost_dro=phys["d_ro"],
                 qos_index=link["q_svc"],
