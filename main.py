@@ -1,3 +1,4 @@
+
 import numpy as np
 
 from agent import RLAROAgent
@@ -63,6 +64,20 @@ def execute_route(env, net_sim, path, fleet_size=12):
     }
 
 
+def _remaining_route_costs(env, target):
+    """Shortest remaining additive d_ro cost from every node to target."""
+    costs = {}
+    for node in env.graph.nodes:
+        path = env.get_dijkstra_route(node, target)
+        if not path or path[-1] != target:
+            raise ValueError(f"No valid route from node {node} to target {target}")
+        costs[node] = float(sum(
+            env.graph[u][v]["cost"] for u, v in zip(path, path[1:])
+        ))
+    costs[target] = 0.0
+    return costs
+
+
 def _route_time_energy(env, path, fleet_size=12):
     """Compute deterministic route time and fleet energy from environment physics."""
     time_min = 0.0
@@ -101,6 +116,7 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
     for _ in range(num_episodes):
         episode_perturbation = float(env.rng.uniform(-0.06, 0.10))
         set_environment_congestion(env, episode_perturbation)
+        remaining_cost = _remaining_route_costs(env, target)
         current = source
         visited = {current}
 
@@ -135,19 +151,11 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
                 qos_index=link["q_svc"],
                 auth_delay_ms=link["b_auth_ms"],
             )
-            # Potential-based shaping: encourage progress toward the destination.
-            # Using gamma * Phi(next) - Phi(current) is less likely to alter the
-            # optimal policy than an arbitrary distance bonus.
-            current_distance = np.linalg.norm(
-                env.node_positions[current] - env.node_positions[target]
-            )
-            next_distance = np.linalg.norm(
-                env.node_positions[action] - env.node_positions[target]
-            )
-            distance_scale = max(float(env.area_size_m) * np.sqrt(2.0), 1.0)
-            phi_current = -current_distance / distance_scale
-            phi_next = -next_distance / distance_scale
-            reward += 0.25 * (agent.gamma * phi_next - phi_current)
+            # Potential shaping uses the same d_ro objective as route costs,
+            # rather than straight-line distance that may ignore graph topology.
+            phi_current = -remaining_cost[current]
+            phi_next = 0.0 if action == target else -remaining_cost[action]
+            reward += agent.gamma * phi_next - phi_current
             reward -= 0.01  # small per-hop cost
 
             revisited = action in visited
