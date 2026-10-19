@@ -1,3 +1,4 @@
+
 import numpy as np
 
 from agent import RLAROAgent
@@ -135,15 +136,20 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
                 qos_index=link["q_svc"],
                 auth_delay_ms=link["b_auth_ms"],
             )
-            # Mild shaping: favor progress and charge a small cost per hop.
+            # Potential-based shaping: encourage progress toward the destination.
+            # Using gamma * Phi(next) - Phi(current) is less likely to alter the
+            # optimal policy than an arbitrary distance bonus.
             current_distance = np.linalg.norm(
                 env.node_positions[current] - env.node_positions[target]
             )
             next_distance = np.linalg.norm(
                 env.node_positions[action] - env.node_positions[target]
             )
-            reward += 0.10 * (current_distance - next_distance) / 1000.0
-            reward -= 0.01
+            distance_scale = max(float(env.area_size_m) * np.sqrt(2.0), 1.0)
+            phi_current = -current_distance / distance_scale
+            phi_next = -next_distance / distance_scale
+            reward += 0.25 * (agent.gamma * phi_next - phi_current)
+            reward -= 0.01  # small per-hop cost
 
             revisited = action in visited
             done = action == target
@@ -153,10 +159,16 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
                 reward -= 0.25
 
             next_neighbors = env.get_neighbors_info(action)
+            next_valid_actions = [int(item[0]) for item in next_neighbors]
+            # A dead end is terminal for learning even if it is not the destination.
+            transition_done = done or not next_valid_actions
             next_state = agent.encode_state(
                 action, _local_features(env, action), next_neighbors
             )
-            agent.store_transition(state, action, reward, next_state, done)
+            agent.store_transition(
+                state, action, reward, next_state, transition_done,
+                next_valid_actions=next_valid_actions,
+            )
             agent.update_policy()
 
             current = action
@@ -194,7 +206,9 @@ def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
     """Train and evaluate methods for one reproducible seed."""
     env = DroneLogisticsEnvironment(num_nodes=10, seed=seed)
     training_network = IoTNetworkSimulator(seed=seed)
-    agent = RLAROAgent(num_nodes=env.num_nodes, seed=seed)
+    agent = RLAROAgent(
+        num_nodes=env.num_nodes, seed=seed, epsilon_decay=0.985
+    )
 
     rl_path = train_agent(
         env, training_network, agent,
@@ -223,6 +237,9 @@ def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
         results[method] = execute_route(env, eval_network, routes[method])
     # Keep rl_path as the evaluated route for compatibility with existing reports.
     results["raw_rl_path"] = raw_rl_path
+    results["raw_rl_metrics"] = execute_route(
+        env, IoTNetworkSimulator(seed=seed + 20000), raw_rl_path
+    )
     results["evaluated_rl_path"] = evaluated_rl_path
     results["rl_path"] = evaluated_rl_path
     results["used_aco_fallback"] = used_aco_fallback
@@ -247,6 +264,18 @@ def main(num_episodes=150):
     evaluator = RLAROEvaluator(seeds=seeds)
     evaluation = evaluator.evaluate(seed_outputs)
     evaluator.print_report(evaluation, rl_path=seed_outputs[0]["rl_path"])
+
+    print("\n--- Raw RL-ARO policy metrics (before ACO fallback) ---")
+    for metric, label in (
+        ("delivery_time_min", "Delivery time (min)"),
+        ("fleet_energy_wh", "Fleet energy (Wh)"),
+        ("pdr_percent", "End-to-end PDR (%)"),
+        ("latency_ms", "Route communication latency (ms)"),
+    ):
+        values = np.asarray([r["raw_rl_metrics"][metric] for r in seed_outputs], dtype=float)
+        print(f"{label:32s}: {values.mean():.2f} ± {values.std(ddof=1):.2f}")
+    print("Fallback rate: " + f"{np.mean([r['used_aco_fallback'] for r in seed_outputs])*100:.1f}%")
+
     dashboard_path = evaluator.generate_dashboard(evaluation, seed_outputs)
     print(f"Dashboard saved to: {dashboard_path}")
 
