@@ -175,10 +175,47 @@ class RLAROAgent:
         alpha=0.55,
         beta=0.45,
     ):
-        base = alpha * (energy_saved_norm - energy_consumed_norm) + beta * (1.0 - data_loss_rate)
-        efficiency = 0.30 * (1.0 - route_cost_dro) + 0.15 * qos_index
-        security_penalty = 0.04 * (auth_delay_ms / 50.0)
-        return float(base + efficiency - security_penalty)
+        """Route-focused reward with bounded, lower-weight link-quality terms.
+
+        The dominant term is negative additive route cost, aligning reward
+        accumulation with the environment's time/energy edge cost. Smaller
+        terms account for energy and communication without rewarding extra
+        hops with a large positive constant.
+        """
+        values = {
+            "energy_saved_norm": energy_saved_norm,
+            "energy_consumed_norm": energy_consumed_norm,
+            "data_loss_rate": data_loss_rate,
+            "route_cost_dro": route_cost_dro,
+            "qos_index": qos_index,
+            "auth_delay_ms": auth_delay_ms,
+            "alpha": alpha,
+            "beta": beta,
+        }
+        values = {name: float(value) for name, value in values.items()}
+        if not all(np.isfinite(value) for value in values.values()):
+            raise ValueError("reward inputs must be finite")
+        if not 0.0 <= values["data_loss_rate"] <= 1.0:
+            raise ValueError("data_loss_rate must be in [0, 1]")
+        if values["auth_delay_ms"] < 0:
+            raise ValueError("auth_delay_ms must be nonnegative")
+
+        energy_saved = float(np.clip(values["energy_saved_norm"], 0.0, 1.0))
+        energy_used = float(np.clip(values["energy_consumed_norm"], 0.0, 1.0))
+        route_cost = float(np.clip(values["route_cost_dro"], 0.0, 1.0))
+        qos = float(np.clip(values["qos_index"], 0.0, 1.0))
+        loss = values["data_loss_rate"]
+        auth_norm = float(np.clip(values["auth_delay_ms"] / 50.0, 0.0, 1.0))
+
+        # Route cost dominates; other factors are deliberately lower-weight.
+        reward = (
+            -2.0 * route_cost
+            + 0.10 * values["alpha"] * (energy_saved - energy_used)
+            - 0.10 * values["beta"] * loss
+            + 0.05 * (qos - 0.80)
+            - 0.02 * auth_norm
+        )
+        return float(reward)
 
     def select_action(self, state_vec, valid_neighbors, training=True):
         valid_neighbors = list(valid_neighbors)
