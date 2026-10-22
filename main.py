@@ -1,4 +1,3 @@
-
 import numpy as np
 
 from agent import RLAROAgent
@@ -25,8 +24,8 @@ def _local_features(env, node):
     return tuple(float(np.mean([row[i] for row in neighbors])) for i in (1, 2, 3))
 
 
-def execute_route(env, net_sim, path, fleet_size=12):
-    """Execute a node path and return route-level metrics expected by evaluator."""
+def execute_route(env, net_sim, path, fleet_size=1):
+    """Execute a node path using one drone and return route-level metrics."""
     if not isinstance(path, (list, tuple)) or len(path) < 2:
         raise ValueError("path must contain at least a source and destination")
     if fleet_size <= 0:
@@ -55,11 +54,8 @@ def execute_route(env, net_sim, path, fleet_size=12):
 
     return {
         "delivery_time_min": float(total_time_min),
-        # Explicit model assumption: fleet_size identical drones execute this route.
         "fleet_energy_wh": float(total_energy_wh * fleet_size),
-        # End-to-end delivery success for a packet traversing every hop.
         "pdr_percent": float(100.0 * route_success_probability),
-        # Sequential hop communication latencies are additive.
         "latency_ms": float(total_network_latency_ms),
     }
 
@@ -78,8 +74,8 @@ def _remaining_route_costs(env, target):
     return costs
 
 
-def _route_time_energy(env, path, fleet_size=12):
-    """Compute deterministic route time and fleet energy from environment physics."""
+def _route_time_energy(env, path, fleet_size=1):
+    """Compute deterministic route time and energy for the specified fleet."""
     time_min = 0.0
     energy_wh = 0.0
     for u, v in zip(path, path[1:]):
@@ -91,11 +87,11 @@ def _route_time_energy(env, path, fleet_size=12):
     return float(time_min), float(energy_wh * fleet_size)
 
 
-def _apply_aco_nonregression_guard(env, rl_path, aco_path, fleet_size=12):
+def _apply_aco_nonregression_guard(env, rl_path, aco_path, fleet_size=1):
     """Fall back to ACO if the learned route worsens either primary metric.
 
-    This is a transparent hybrid/safety-shield evaluation, not evidence that
-    the learned policy itself outperforms ACO.
+    This hybrid/safety-shield evaluation does not establish that the learned
+    policy itself outperforms ACO.
     """
     rl_time, rl_energy = _route_time_energy(env, rl_path, fleet_size)
     aco_time, aco_energy = _route_time_energy(env, aco_path, fleet_size)
@@ -106,7 +102,7 @@ def _apply_aco_nonregression_guard(env, rl_path, aco_path, fleet_size=12):
     return (list(aco_path), True) if regresses else (list(rl_path), False)
 
 
-def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
+def train_agent(env, net_sim, agent, num_episodes=300, max_steps=15,
                 evaluation_perturbation=0.06):
     """Train the shared policy and return its greedy source-to-destination path."""
     if num_episodes <= 0 or max_steps <= 0:
@@ -137,7 +133,7 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
             link = net_sim.simulate_wireless_link(
                 distance_m=phys["distance_m"],
                 congestion_level=phys["congestion"],
-                num_drones=12,
+                num_drones=1,
             )
             reward = agent.compute_reward(
                 energy_saved_norm=np.clip(
@@ -151,12 +147,10 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
                 qos_index=link["q_svc"],
                 auth_delay_ms=link["b_auth_ms"],
             )
-            # Potential shaping uses the same d_ro objective as route costs,
-            # rather than straight-line distance that may ignore graph topology.
             phi_current = -remaining_cost[current]
             phi_next = 0.0 if action == target else -remaining_cost[action]
             reward += agent.gamma * phi_next - phi_current
-            reward -= 0.01  # small per-hop cost
+            reward -= 0.01
 
             revisited = action in visited
             done = action == target
@@ -167,7 +161,6 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
 
             next_neighbors = env.get_neighbors_info(action)
             next_valid_actions = [int(item[0]) for item in next_neighbors]
-            # A dead end is terminal for learning even if it is not the destination.
             transition_done = done or not next_valid_actions
             next_state = agent.encode_state(
                 action, _local_features(env, action), next_neighbors
@@ -183,7 +176,6 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
 
         agent.decay_exploration()
 
-    # Evaluate the learned policy under the same fixed condition used by baselines.
     set_environment_congestion(env, evaluation_perturbation)
     path = [source]
     current = source
@@ -196,7 +188,9 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
         if not neighbor_info:
             path.extend(env.get_dijkstra_route(current, target)[1:])
             break
-        state = agent.encode_state(current, _local_features(env, current), neighbor_info)
+        state = agent.encode_state(
+            current, _local_features(env, current), neighbor_info
+        )
         next_node = agent.select_action(
             state, [int(item[0]) for item in neighbor_info], training=False
         )
@@ -209,7 +203,7 @@ def train_agent(env, net_sim, agent, num_episodes=120, max_steps=15,
     return path
 
 
-def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
+def run_single_seed(seed, num_episodes=300, evaluation_perturbation=0.06):
     """Train and evaluate methods for one reproducible seed."""
     env = DroneLogisticsEnvironment(num_nodes=10, seed=seed)
     training_network = IoTNetworkSimulator(seed=seed)
@@ -223,7 +217,6 @@ def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
         evaluation_perturbation=evaluation_perturbation,
     )
 
-    # All methods are routed/evaluated on the same graph condition.
     set_environment_congestion(env, evaluation_perturbation)
     raw_rl_path = list(rl_path)
     aco_path = env.get_aco_route(0, 9)
@@ -238,11 +231,10 @@ def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
     }
 
     results = {}
-    for index, method in enumerate(("ACO", "TSP-D", "DBSCAN", "RL-ARO")):
-        # Identical RNG initialization gives the methods common link-noise draws.
+    for method in ("ACO", "TSP-D", "DBSCAN", "RL-ARO"):
         eval_network = IoTNetworkSimulator(seed=seed + 10000)
         results[method] = execute_route(env, eval_network, routes[method])
-    # Keep rl_path as the evaluated route for compatibility with existing reports.
+
     results["raw_rl_path"] = raw_rl_path
     results["raw_rl_metrics"] = execute_route(
         env, IoTNetworkSimulator(seed=seed + 20000), raw_rl_path
@@ -253,20 +245,29 @@ def run_single_seed(seed, num_episodes=120, evaluation_perturbation=0.06):
     return results
 
 
-def main(num_episodes=150):
-    """Run one episode-count experiment; rerun with 250 or 400 separately."""
+def main(num_episodes=300):
+    """Run one 300-episode experiment per seed."""
     if num_episodes <= 0:
         raise ValueError("num_episodes must be positive")
     seeds = [42, 123, 256, 512, 1024]
-    print(f"Running simulation for {len(seeds)} seeds, {num_episodes} episodes each...")
+    print(
+        f"Running simulation for {len(seeds)} seeds, "
+        f"{num_episodes} episodes each, using 1 drone..."
+    )
 
     seed_outputs = []
     for index, seed in enumerate(seeds, start=1):
         result = run_single_seed(seed, num_episodes=num_episodes)
         seed_outputs.append(result)
-        fallback_note = " (ACO safety fallback used)" if result["used_aco_fallback"] else ""
+        fallback_note = (
+            " (ACO safety fallback used)"
+            if result["used_aco_fallback"] else ""
+        )
         print(f"Seed {index}/{len(seeds)}: raw RL path {result['raw_rl_path']}")
-        print(f"  Evaluated hybrid path {result['evaluated_rl_path']}{fallback_note}")
+        print(
+            f"  Evaluated hybrid path {result['evaluated_rl_path']}"
+            f"{fallback_note}"
+        )
 
     evaluator = RLAROEvaluator(seeds=seeds)
     evaluation = evaluator.evaluate(seed_outputs)
@@ -279,9 +280,16 @@ def main(num_episodes=150):
         ("pdr_percent", "End-to-end PDR (%)"),
         ("latency_ms", "Route communication latency (ms)"),
     ):
-        values = np.asarray([r["raw_rl_metrics"][metric] for r in seed_outputs], dtype=float)
+        values = np.asarray(
+            [r["raw_rl_metrics"][metric] for r in seed_outputs],
+            dtype=float,
+        )
         print(f"{label:32s}: {values.mean():.2f} ± {values.std(ddof=1):.2f}")
-    print("Fallback rate: " + f"{np.mean([r['used_aco_fallback'] for r in seed_outputs])*100:.1f}%")
+
+    print(
+        "Fallback rate: "
+        f"{np.mean([r['used_aco_fallback'] for r in seed_outputs]) * 100:.1f}%"
+    )
 
     dashboard_path = evaluator.generate_dashboard(evaluation, seed_outputs)
     print(f"Dashboard saved to: {dashboard_path}")
