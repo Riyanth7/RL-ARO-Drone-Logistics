@@ -353,7 +353,7 @@ class RLAROAgent:
     def decay_exploration(self):
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
 
-    def fit_action_targets(self, examples, updates=100):
+        def fit_action_targets(self, examples, updates=100):
         """Fit Q-values to teacher labels without polluting the RL replay."""
         if updates <= 0 or not examples:
             return
@@ -365,27 +365,40 @@ class RLAROAgent:
             )
             zero_state = np.zeros(self.state_dim, dtype=np.float64)
             normalized = []
+
             for state, action, target_q in examples:
                 state = np.asarray(state, dtype=np.float64)
                 if state.shape != (self.state_dim,):
-                    raise ValueError(f"state must have shape ({self.state_dim},)")
-                if not isinstance(action, (int, np.integer)) or not 0 <= action < self.num_nodes:
+                    raise ValueError(
+                        f"state must have shape ({self.state_dim},)"
+                    )
+                if (
+                    not isinstance(action, (int, np.integer))
+                    or not 0 <= action < self.num_nodes
+                ):
                     raise ValueError("action must be a valid node index")
                 if not np.isfinite(target_q):
                     raise ValueError("target_q must be finite")
+
                 normalized.append((state, int(action), float(target_q)))
 
-            repeats = max(1, int(np.ceil(self.batch_size / len(normalized))))
+            repeats = max(
+                1, int(np.ceil(self.batch_size / len(normalized)))
+            )
             for _ in range(repeats):
                 for state, action, target_q in normalized:
                     self.store_transition(
-                        state, action, target_q, zero_state, True,
+                        state,
+                        action,
+                        target_q,
+                        zero_state,
+                        True,
                         next_valid_actions=(),
                     )
 
             for _ in range(int(updates)):
                 self.update_policy()
+
             self.target_network.copy_weights_from(self.q_network)
         finally:
-            self.replay_buffer = 
-original_buffer
+            self.replay_buffer = original_buffer
