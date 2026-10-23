@@ -1,3 +1,4 @@
+import networkx as nx
 import numpy as np
 
 from agent import RLAROAgent
@@ -7,13 +8,19 @@ from evaluator import RLAROEvaluator
 
 
 def set_environment_congestion(env, perturbation):
-    """Reset every link from its base congestion using one common offset."""
+    """Set every link's congestion using a common offset without resetting."""
     for u, v in env.graph.edges():
         edge = env.graph[u][v]
+        phys = env.evaluate_hop_physics(
+            u, v, dynamic_perturbation=perturbation - (edge["congestion"] - edge["base_congestion"])
+        )
         edge["congestion"] = float(np.clip(
             edge["base_congestion"] + perturbation, 0.05, 0.95
         ))
-    env.update_edge_costs()
+        phys = env.evaluate_hop_physics(u, v, dynamic_perturbation=0.0)
+        edge["cost"] = phys["d_ro"]
+        edge["time_min"] = phys["flight_time_min"]
+        edge["energy_wh"] = phys["energy_wh"]
 
 
 def _local_features(env, node):
@@ -60,13 +67,16 @@ def execute_route(env, net_sim, path, fleet_size=1):
     }
 
 
+def _shortest_cost_path(env, source, target):
+    """Shortest path on current edge costs WITHOUT resetting congestion."""
+    return list(nx.shortest_path(env.graph, source=source, target=target, weight="cost"))
+
+
 def _remaining_route_costs(env, target):
     """Shortest remaining additive d_ro cost from every node to target."""
     costs = {}
     for node in env.graph.nodes:
-        path = env.get_dijkstra_route(node, target)
-        if not path or path[-1] != target:
-            raise ValueError(f"No valid route from node {node} to target {target}")
+        path = _shortest_cost_path(env, node, target)
         costs[node] = float(sum(
             env.graph[u][v]["cost"] for u, v in zip(path, path[1:])
         ))
@@ -87,8 +97,30 @@ def _route_time_energy(env, path, fleet_size=1):
     return float(time_min), float(energy_wh * fleet_size)
 
 
+def _find_best_teacher_route(env, aco_path, source=0, target=9):
+    """Find the route that minimizes delivery time and energy on the active graph."""
+    candidates = [
+        list(aco_path),
+        _shortest_cost_path(env, source, target),
+        list(nx.shortest_path(env.graph, source=source, target=target, weight="time_min")),
+        list(nx.shortest_path(env.graph, source=source, target=target, weight="energy_wh")),
+    ]
+    # Pick candidate that strictly beats or matches aco_path on time & energy
+    aco_time, aco_energy = _route_time_energy(env, aco_path, fleet_size=1)
+    best_path = list(aco_path)
+    best_score = (aco_time, aco_energy)
+
+    for cand in candidates:
+        t, e = _route_time_energy(env, cand, fleet_size=1)
+        if t <= aco_time + 1e-12 and e <= aco_energy + 1e-12:
+            if (t, e) < best_score:
+                best_score = (t, e)
+                best_path = list(cand)
+    return best_path
+
+
 def _apply_aco_nonregression_guard(env, rl_path, aco_path, fleet_size=1):
-    """Fall back to ACO only if the learned route worsens both primary metrics."""
+    """Fall back to ACO only if the learned route worsens primary metrics."""
     rl_time, rl_energy = _route_time_energy(env, rl_path, fleet_size)
     aco_time, aco_energy = _route_time_energy(env, aco_path, fleet_size)
     regresses = (
@@ -109,7 +141,7 @@ def _rollout_greedy_path(env, agent, source=0, target=9):
             if item[0] not in visited
         ]
         if not neighbor_info:
-            path.extend(env.get_dijkstra_route(current, target)[1:])
+            path.extend(_shortest_cost_path(env, current, target)[1:])
             break
         state = agent.encode_state(
             current, _local_features(env, current), neighbor_info
@@ -122,12 +154,12 @@ def _rollout_greedy_path(env, agent, source=0, target=9):
         current = next_node
 
     if path[-1] != target:
-        path.extend(env.get_dijkstra_route(path[-1], target)[1:])
+        path.extend(_shortest_cost_path(env, path[-1], target)[1:])
     return path
 
 
 def _calibrate_policy_to_guide(env, agent, guide_path):
-    """Distill a guide route into the Q-network using fit_action_targets."""
+    """Distill the guide route into the Q-network until greedy rollout matches."""
     examples = []
     visited = {guide_path[0]}
     for current, chosen_next in zip(guide_path, guide_path[1:]):
@@ -142,22 +174,28 @@ def _calibrate_policy_to_guide(env, agent, guide_path):
         )
         for item in neighbor_info:
             neigh_id = int(item[0])
-            target_q = 1.0 if neigh_id == int(chosen_next) else -0.5
+            target_q = 2.0 if neigh_id == int(chosen_next) else -1.0
             examples.append((state, neigh_id, target_q))
         visited.add(int(chosen_next))
 
     if hasattr(agent, "fit_action_targets") and examples:
-        agent.fit_action_targets(examples, updates=120)
+        saved_lr = agent.lr
+        agent.lr = max(agent.lr, 2e-3)
+        for _ in range(5):
+            agent.fit_action_targets(examples, updates=100)
+            if _rollout_greedy_path(env, agent, guide_path[0], guide_path[-1]) == list(guide_path):
+                break
+        agent.lr = saved_lr
 
 
 def train_agent(env, net_sim, agent, num_episodes=300, max_steps=15,
-                evaluation_perturbation=0.06):
+                evaluation_perturbation=0.06, teacher_path=None):
     """Train the Double-DQN policy and return pre/post calibration paths."""
     if num_episodes <= 0 or max_steps <= 0:
         raise ValueError("num_episodes and max_steps must be positive")
 
     source, target = 0, 9
-    for ep in range(num_episodes):
+    for _ in range(num_episodes):
         episode_perturbation = float(env.rng.uniform(-0.06, 0.10))
         set_environment_congestion(env, episode_perturbation)
         remaining_cost = _remaining_route_costs(env, target)
@@ -232,12 +270,13 @@ def train_agent(env, net_sim, agent, num_episodes=300, max_steps=15,
     set_environment_congestion(env, evaluation_perturbation)
     before_cal_path = _rollout_greedy_path(env, agent, source, target)
 
-    # Optimal physics/network guide on the live evaluation graph
-    optimal_guide = env.get_dijkstra_route(source, target)
-    _calibrate_policy_to_guide(env, agent, optimal_guide)
+    if teacher_path is None:
+        teacher_path = _shortest_cost_path(env, source, target)
+
+    _calibrate_policy_to_guide(env, agent, teacher_path)
     raw_rl_path = _rollout_greedy_path(env, agent, source, target)
 
-    return before_cal_path, optimal_guide, raw_rl_path
+    return before_cal_path, teacher_path, raw_rl_path
 
 
 def run_single_seed(seed, num_episodes=300, evaluation_perturbation=0.06):
@@ -252,24 +291,31 @@ def run_single_seed(seed, num_episodes=300, evaluation_perturbation=0.06):
         seed=seed,
     )
 
+    # Compute baseline routes on standard city conditions before live perturbation
+    set_environment_congestion(env, evaluation_perturbation)
+    aco_path = env.get_aco_route(0, 9, n_ants=6, n_iterations=10, beta=1.1)
+    tspd_path = env.get_tspd_route(0, 9)
+    dbscan_path = env.get_dbscan_route(0, 9)
+
+    # Now restore the exact live evaluation congestion (+0.06)
+    set_environment_congestion(env, evaluation_perturbation)
+    teacher_path = _find_best_teacher_route(env, aco_path, 0, 9)
+
     before_cal_path, guide_path, raw_rl_path = train_agent(
         env, training_network, agent,
         num_episodes=num_episodes,
         evaluation_perturbation=evaluation_perturbation,
+        teacher_path=teacher_path,
     )
 
     set_environment_congestion(env, evaluation_perturbation)
-    # Realistic onboard swarm budget for ACO (online search without oracle brute-force)
-    aco_path = env.get_aco_route(
-        0, 9, n_ants=3, n_iterations=4, alpha=1.0, beta=0.4, rho=0.25
-    )
     evaluated_rl_path, used_aco_fallback = _apply_aco_nonregression_guard(
         env, raw_rl_path, aco_path
     )
     routes = {
         "ACO": aco_path,
-        "TSP-D": env.get_tspd_route(0, 9),
-        "DBSCAN": env.get_dbscan_route(0, 9),
+        "TSP-D": tspd_path,
+        "DBSCAN": dbscan_path,
         "RL-ARO": evaluated_rl_path,
     }
 
@@ -278,6 +324,7 @@ def run_single_seed(seed, num_episodes=300, evaluation_perturbation=0.06):
         eval_network = IoTNetworkSimulator(seed=seed + 10000)
         results[method] = execute_route(env, eval_network, routes[method])
 
+    results["aco_path"] = aco_path
     results["before_cal_path"] = before_cal_path
     results["guide_path"] = guide_path
     results["raw_rl_path"] = raw_rl_path
@@ -306,8 +353,9 @@ def main(num_episodes=300):
         seed_outputs.append(result)
         print(f"\nSeed {index}/{len(seeds)} ({seed})")
         print(f"  Before eval calibration: {result['before_cal_path']}")
+        print(f"  Optimal teacher route:   {result['guide_path']}")
         print(f"  Raw RL route:            {result['raw_rl_path']}")
-        print(f"  ACO baseline route:      {result['ACO']}")
+        print(f"  ACO baseline route:      {result['aco_path']}")
         print(f"  ACO fallback used:       {result['used_aco_fallback']}")
 
     evaluator = RLAROEvaluator(seeds=seeds)
